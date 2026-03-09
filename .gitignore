@@ -22,3 +22,14 @@ wheels/
 .vscode/
 venv/
 env/
+
+# Sensitive files
+*.pem
+
+# Large files / local data
+models/
+data/
+
+# Temp scripts
+temp.sh
+requirements_weiqu.txt
