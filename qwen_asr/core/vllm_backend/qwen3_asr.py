@@ -978,13 +978,16 @@ class Qwen3ASRForConditionalGeneration(
                 "Supported task types are 'transcribe' and 'translate'."
             )
         full_lang_name_to = cls.supported_languages.get(to_language, to_language)
+        system_block = f"<|im_start|>system\n{request_prompt}<|im_end|>\n"
         if to_language is None:
             prompt = (
+                f"{system_block}"
                 f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
                 f"<|im_start|>assistant\n"
             )
         else:
             prompt = (
+                f"{system_block}"
                 f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
                 f"<|im_start|>assistant\nlanguage {full_lang_name_to}<asr_text>"
             )

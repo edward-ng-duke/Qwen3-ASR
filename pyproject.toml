@@ -37,6 +37,11 @@ dependencies = [
 vllm = [
   "vllm==0.14.0",
 ]
+test = [
+  "pytest",
+  "httpx",
+  "anyio",
+]
 
 [project.urls]
 Homepage = "https://github.com/Qwen/Qwen3-ASR"

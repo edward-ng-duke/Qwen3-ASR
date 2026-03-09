@@ -40,7 +40,8 @@ from qwen_asr import Qwen3ASRModel
 
 
 ASR_MODEL_PATH = "Qwen/Qwen3-ASR-1.7B"
-FORCED_ALIGNER_PATH = "Qwen/Qwen3-ForcedAligner-0.6B"
+ASR_MODEL_PATH = "/home/edward/research/Qwen3-ASR/models/Qwen3-ASR-1.7B"
+FORCED_ALIGNER_PATH = "/home/edward/research/Qwen3-ASR/models/Qwen3-ForcedAligner-0.6B"
 
 URL_ZH = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav"
 URL_EN = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav"
