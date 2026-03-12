@@ -35,6 +35,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 import websockets
 from openai import AsyncOpenAI
 
+from qwen_asr.inference.utils import detect_and_fix_repetitions
+
 logger = logging.getLogger("asr")
 
 # ---------------------------------------------------------------------------
@@ -54,6 +56,8 @@ class ASRConfig:
     max_concurrent_infer: int = 10
     tokenizer_path: str = ""
     vad_url: str = "ws://localhost:7064"
+    repetition_threshold: int = 10
+    energy_vad_threshold: float = 0.01
 
     @property
     def max_audio_samples(self) -> int:
@@ -79,9 +83,11 @@ class StreamingSession:
     _needs_dedup: bool = False
     _last_sent_len: int = 0
     _current_window_text: str = ""
+    _recent_confirmed: str = ""
     _vad_speech_active: bool = False
     _vad_ever_had_speech: bool = False
     _vad_chunks_since_speech_end: int = 0
+    _energy_speech_active: bool = False
 
     def __post_init__(self):
         self._audio_chunks: list[np.ndarray] = []
@@ -123,8 +129,13 @@ class StreamingSession:
             self.finalized_text += self._pre_trim_text
             self._pre_trim_text = ""
 
-        # Save text for overlap detection after next transcription
-        self._pre_trim_text = self.prev_text or self.stable_text or ""
+        # Sentence-aware: commit complete sentences directly, only
+        # the trailing fragment needs cross-window dedup
+        current_text = self.prev_text or self.stable_text or ""
+        complete, fragment = _split_at_last_sentence_boundary(current_text)
+        if complete:
+            self.finalized_text += complete
+        self._pre_trim_text = fragment
         self._needs_dedup = bool(self._pre_trim_text)
 
         self._set_audio(self.audio_accum[-max_samples:])
@@ -136,13 +147,22 @@ class StreamingSession:
 # ---------------------------------------------------------------------------
 # ASR helpers
 # ---------------------------------------------------------------------------
+def _check_energy_vad(chunk: np.ndarray, threshold: float = 0.01) -> bool:
+    """Return True if audio chunk RMS exceeds silence threshold."""
+    if chunk.shape[0] == 0:
+        return False
+    return float(np.sqrt(np.mean(chunk ** 2))) > threshold
+
+
 _ASR_TEXT_TAG = "<asr_text>"
 
 
-def _parse_asr_output(raw: str) -> tuple:
+def _parse_asr_output(raw: str, repetition_threshold: int = 10) -> tuple:
     if not raw:
         return "", ""
     s = raw.strip()
+    if repetition_threshold > 0:
+        s = detect_and_fix_repetitions(s, threshold=repetition_threshold)
     if _ASR_TEXT_TAG in s:
         meta, text = s.split(_ASR_TEXT_TAG, 1)
         lang = ""
@@ -168,6 +188,29 @@ def _suffix_prefix_overlap(a: str, b: str) -> int:
         if a[-length:] == b[:length]:
             return length
     return 0
+
+
+def _remove_output_duplicates(delta: str, recent: str, min_match_len: int = 4) -> str:
+    """Remove prefix of delta if it duplicates a suffix of recently confirmed text."""
+    if not delta or not recent:
+        return delta
+    max_check = min(len(delta), len(recent))
+    for length in range(max_check, min_match_len - 1, -1):
+        if recent.endswith(delta[:length]):
+            return delta[length:]
+    return delta
+
+
+def _split_at_last_sentence_boundary(text: str) -> tuple[str, str]:
+    """Split text into (complete_sentences, trailing_fragment).
+
+    Returns text up to and including the last sentence terminator,
+    and the remaining fragment. If no terminator found, returns ("", text).
+    """
+    for i in range(len(text) - 1, -1, -1):
+        if text[i] in SENTENCE_TERMINATORS:
+            return text[:i + 1], text[i + 1:]
+    return "", text
 
 
 # ---------------------------------------------------------------------------
@@ -230,12 +273,17 @@ class ASREngine:
                 logger.error(f"vLLM API error: {e}")
                 return {"error": f"vLLM API error: {e}"}
 
-        language, text = _parse_asr_output(raw)
+        language, text = _parse_asr_output(raw, self.config.repetition_threshold)
         self._stabilize(session, text, language)
 
         # Compute incremental output
         confirmed = session.finalized_text + session.stable_text
         delta = confirmed[session._last_sent_len:]
+        # Output-level dedup guard: remove prefix of delta that duplicates recent output
+        if delta:
+            delta = _remove_output_duplicates(delta, session._recent_confirmed)
+        if delta:
+            session._recent_confirmed = (session._recent_confirmed + delta)[-200:]
         window_text = session._current_window_text
         preview = window_text[len(session.stable_text):] if len(window_text) > len(session.stable_text) else ""
         session._last_sent_len = len(confirmed)
@@ -380,6 +428,8 @@ async def ws_asr(ws: WebSocket):
 
     # Connect to external VAD service
     vad_ws = None
+    if not config.vad_url:
+        logger.info(f"External VAD disabled, using energy VAD (threshold={config.energy_vad_threshold})")
     if config.vad_url:
         try:
             vad_ws = await websockets.connect(
@@ -393,13 +443,13 @@ async def ws_asr(ws: WebSocket):
             }))
             init_resp = json.loads(await vad_ws.recv())
             if init_resp.get("status") != "initialized":
-                logger.warning("VAD init failed, running without VAD")
+                logger.warning("VAD init failed, falling back to energy VAD")
                 await vad_ws.close()
                 vad_ws = None
             else:
-                logger.info("VAD connected")
+                logger.info(f"External VAD connected: {config.vad_url}")
         except Exception as e:
-            logger.warning(f"VAD unavailable ({e}), running without VAD")
+            logger.warning(f"External VAD unavailable ({e}), falling back to energy VAD (threshold={config.energy_vad_threshold})")
             vad_ws = None
 
     timeout_event = asyncio.Event()
@@ -493,7 +543,21 @@ async def ws_asr(ws: WebSocket):
                             and session._vad_chunks_since_speech_end <= 3)
                     )
                 else:
-                    should_infer = True  # No VAD → always infer
+                    # No external VAD → use energy-based fallback
+                    is_speech = _check_energy_vad(chunk, config.energy_vad_threshold)
+                    if is_speech:
+                        session._energy_speech_active = True
+                        session._vad_chunks_since_speech_end = 0
+                    else:
+                        if session._energy_speech_active:
+                            session._energy_speech_active = False
+                            session._vad_chunks_since_speech_end = 0
+                        else:
+                            session._vad_chunks_since_speech_end += 1
+                    should_infer = (
+                        session._energy_speech_active
+                        or session._vad_chunks_since_speech_end <= 3
+                    )
                 if should_infer and (infer_task is None or infer_task.done()) and (
                     now - last_infer_time >= min_infer_interval
                 ):
@@ -1007,6 +1071,18 @@ def parse_args():
         default="ws://localhost:7064",
         help="VAD WebSocket server URL (empty string to disable)",
     )
+    p.add_argument(
+        "--energy-vad-threshold",
+        type=float,
+        default=0.01,
+        help="RMS threshold for energy-based VAD fallback (0 to disable)",
+    )
+    p.add_argument(
+        "--repetition-threshold",
+        type=int,
+        default=10,
+        help="Pattern repeat count threshold for repetition detection (0 to disable)",
+    )
     p.add_argument("--ssl-certfile", default=None, help="SSL cert file")
     p.add_argument("--ssl-keyfile", default=None, help="SSL key file")
     return p.parse_args()
@@ -1027,6 +1103,8 @@ def main():
         max_audio_sec=args.max_audio_sec,
         tokenizer_path=args.tokenizer,
         vad_url=args.vad_url,
+        repetition_threshold=args.repetition_threshold,
+        energy_vad_threshold=args.energy_vad_threshold,
     )
 
     certfile = args.ssl_certfile

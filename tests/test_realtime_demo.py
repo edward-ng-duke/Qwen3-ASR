@@ -18,8 +18,11 @@ from realtime_demo_1 import (
     ASRConfig,
     ASREngine,
     StreamingSession,
+    _check_energy_vad,
     _common_prefix_len,
     _parse_asr_output,
+    _remove_output_duplicates,
+    _split_at_last_sentence_boundary,
     _suffix_prefix_overlap,
     _to_wav,
     app,
@@ -236,6 +239,7 @@ class TestStabilize:
         cfg = ASRConfig(unfixed_chunk_num=2)
         eng = ASREngine.__new__(ASREngine)
         eng.config = cfg
+        eng._tokenizer = None
         return eng
 
     def test_no_lock_within_unfixed_chunks(self):
@@ -474,3 +478,274 @@ class TestWebSocketIntegration:
         assert resp.status_code == 200
         assert "PCMProcessor" in resp.text
         assert "_resample" in resp.text  # Verify resampling was moved to worklet
+
+
+# ===========================================================================
+# Part 5: New anti-repetition feature tests
+# ===========================================================================
+class TestEnergyVAD:
+    def test_silence_returns_false(self):
+        chunk = np.zeros(16000, dtype=np.float32)
+        assert _check_energy_vad(chunk, threshold=0.01) is False
+
+    def test_speech_returns_true(self):
+        chunk = np.full(16000, 0.1, dtype=np.float32)
+        assert _check_energy_vad(chunk, threshold=0.01) is True
+
+    def test_empty_chunk(self):
+        chunk = np.array([], dtype=np.float32)
+        assert _check_energy_vad(chunk) is False
+
+    def test_threshold_boundary(self):
+        # RMS of constant 0.01 signal = 0.01, should not exceed threshold=0.01
+        chunk = np.full(16000, 0.01, dtype=np.float32)
+        assert _check_energy_vad(chunk, threshold=0.01) is False
+        assert _check_energy_vad(chunk, threshold=0.005) is True
+
+
+class TestRemoveOutputDuplicates:
+    def test_no_overlap(self):
+        assert _remove_output_duplicates("xyz", "abc") == "xyz"
+
+    def test_full_prefix_overlap(self):
+        assert _remove_output_duplicates("world!", "hello world") == "!"
+
+    def test_partial_overlap(self):
+        # "你好世界" ends with "就是我认为" prefix "就是我认" (4 chars, meets min_match_len)
+        assert _remove_output_duplicates("就是我认为好的", "前面就是我认") == "为好的"
+
+    def test_empty_delta(self):
+        assert _remove_output_duplicates("", "abc") == ""
+
+    def test_empty_recent(self):
+        assert _remove_output_duplicates("abc", "") == "abc"
+
+    def test_short_match_ignored(self):
+        # Overlap of 2 chars < min_match_len=4
+        assert _remove_output_duplicates("ab123", "xxab") == "ab123"
+
+    def test_exact_duplicate(self):
+        assert _remove_output_duplicates("hello", "hello") == ""
+
+
+class TestSplitAtLastSentenceBoundary:
+    def test_chinese_period(self):
+        complete, frag = _split_at_last_sentence_boundary("你好。世界")
+        assert complete == "你好。"
+        assert frag == "世界"
+
+    def test_no_terminator(self):
+        complete, frag = _split_at_last_sentence_boundary("hello world")
+        assert complete == ""
+        assert frag == "hello world"
+
+    def test_ends_with_terminator(self):
+        complete, frag = _split_at_last_sentence_boundary("hello world.")
+        assert complete == "hello world."
+        assert frag == ""
+
+    def test_multiple_terminators(self):
+        complete, frag = _split_at_last_sentence_boundary("a。b！c")
+        assert complete == "a。b！"
+        assert frag == "c"
+
+    def test_empty_string(self):
+        complete, frag = _split_at_last_sentence_boundary("")
+        assert complete == ""
+        assert frag == ""
+
+    def test_question_mark(self):
+        complete, frag = _split_at_last_sentence_boundary("你好？世界")
+        assert complete == "你好？"
+        assert frag == "世界"
+
+
+class TestParseAsrOutputRepetition:
+    def test_cleans_char_repetitions(self):
+        # 25 repeated 好 should be cleaned (threshold=10)
+        raw = "language zh<asr_text>你" + "好" * 25
+        lang, text = _parse_asr_output(raw, repetition_threshold=10)
+        assert text.count("好") < 25
+
+    def test_cleans_pattern_repetitions(self):
+        # "你好" repeated 25 times
+        raw = "language zh<asr_text>" + "你好" * 25
+        lang, text = _parse_asr_output(raw, repetition_threshold=10)
+        assert text.count("你好") < 25
+
+    def test_no_cleaning_below_threshold(self):
+        raw = "language zh<asr_text>" + "你好" * 5
+        lang, text = _parse_asr_output(raw, repetition_threshold=10)
+        assert text == "你好" * 5
+
+    def test_disabled_when_threshold_zero(self):
+        raw = "language zh<asr_text>" + "好" * 25
+        lang, text = _parse_asr_output(raw, repetition_threshold=0)
+        assert text == "好" * 25
+
+
+# ===========================================================================
+# Part 6: E2E streaming simulation tests
+# ===========================================================================
+def _has_significant_repetition(text: str, min_pattern_len: int = 4, max_repeats: int = 3) -> bool:
+    """Check if text contains any pattern repeated consecutively too many times."""
+    n = len(text)
+    for k in range(min_pattern_len, min(n // max_repeats + 1, 30)):
+        for i in range(n - k * max_repeats + 1):
+            pat = text[i:i + k]
+            count = 1
+            pos = i + k
+            while pos + k <= n and text[pos:pos + k] == pat:
+                count += 1
+                pos += k
+            if count >= max_repeats:
+                return True
+    return False
+
+
+class TestStreamingE2E:
+    """E2E tests: real ASREngine._stabilize + mocked vLLM API responses.
+
+    These tests simulate realistic streaming ASR scenarios by:
+    - Using the real stabilization, dedup, and delta computation pipeline
+    - Mocking only the vLLM API layer (client.audio.transcriptions.create)
+    - Feeding progressive transcription results as a real model would produce
+    """
+
+    def make_engine_and_session(self, context_sec=10, unfixed_chunk_num=4,
+                                unfixed_token_num=0):
+        cfg = ASRConfig(
+            unfixed_chunk_num=unfixed_chunk_num,
+            unfixed_token_num=unfixed_token_num,
+            repetition_threshold=10,
+        )
+        eng = ASREngine.__new__(ASREngine)
+        eng.config = cfg
+        eng._tokenizer = None
+        eng._semaphore = asyncio.Semaphore(10)
+        eng.client = MagicMock()
+        session = StreamingSession(config=cfg, context_window_sec=context_sec)
+        return eng, session
+
+    def _setup_responses(self, eng, responses):
+        """Configure mock to return a sequence of ASR transcription results."""
+        mock_transcription = MagicMock()
+        call_idx = [0]
+
+        async def fake_create(**kwargs):
+            idx = min(call_idx[0], len(responses) - 1)
+            mock_transcription.text = responses[idx]
+            call_idx[0] += 1
+            return mock_transcription
+
+        eng.client.audio.transcriptions.create = AsyncMock(side_effect=fake_create)
+        return call_idx
+
+    async def _run_streaming(self, eng, session, responses):
+        """Helper: send chunks and collect deltas."""
+        self._setup_responses(eng, responses)
+        deltas = []
+        for i in range(len(responses)):
+            chunk = np.random.randn(16000).astype(np.float32) * 0.1
+            session.append_audio(chunk)
+            result = await eng.transcribe(session)
+            if result.get("delta"):
+                deltas.append(result["delta"])
+        return deltas
+
+    def test_progressive_chinese_no_repetition(self):
+        """Scenario 1: Progressive Chinese transcription without window trim."""
+        eng, session = self.make_engine_and_session(context_sec=0)  # unlimited
+
+        responses = [
+            "language Chinese<asr_text>页面有哪些",
+            "language Chinese<asr_text>页面有哪些？嗯嗯",
+            "language Chinese<asr_text>页面有哪些？嗯嗯，页面的加载速度",
+            "language Chinese<asr_text>页面有哪些？嗯嗯，页面的加载速度、质量评分是怎么样的？",
+            "language Chinese<asr_text>页面有哪些？嗯嗯，页面的加载速度、质量评分是怎么样的？就是我认为，",
+            "language Chinese<asr_text>页面有哪些？嗯嗯，页面的加载速度、质量评分是怎么样的？就是我认为，就是基本上你所有事儿都可以靠它干。",
+            "language Chinese<asr_text>页面有哪些？嗯嗯，页面的加载速度、质量评分是怎么样的？就是我认为，就是基本上你所有事儿都可以靠它干。你有什么事儿是不能靠它干的呢？",
+            "language Chinese<asr_text>页面有哪些？嗯嗯，页面的加载速度、质量评分是怎么样的？就是我认为，就是基本上你所有事儿都可以靠它干。你有什么事儿是不能靠它干的呢？我我就是你只要是",
+            "language Chinese<asr_text>页面有哪些？嗯嗯，页面的加载速度、质量评分是怎么样的？就是我认为，就是基本上你所有事儿都可以靠它干。你有什么事儿是不能靠它干的呢？我我就是你只要是如果你的工作就是坐在办公室面前对这一台电脑，那这个事儿。",
+        ]
+
+        deltas = asyncio.run(self._run_streaming(eng, session, responses))
+        joined = "".join(deltas)
+        assert len(joined) > 0, "Should have produced some output"
+        assert not _has_significant_repetition(joined), \
+            f"Repetition detected in delta output: {joined[:200]}..."
+
+    def test_sliding_window_no_repetition(self):
+        """Scenario 2: Window trim triggers cross-window dedup."""
+        eng, session = self.make_engine_and_session(context_sec=3)
+
+        responses = [
+            "language Chinese<asr_text>今天天气真好。",
+            "language Chinese<asr_text>今天天气真好。我们去公园",
+            "language Chinese<asr_text>今天天气真好。我们去公园散步吧。",
+            # Window trims here (>3s audio), model re-transcribes retained audio:
+            "language Chinese<asr_text>我们去公园散步吧。",
+            "language Chinese<asr_text>我们去公园散步吧。路上看到了",
+            "language Chinese<asr_text>我们去公园散步吧。路上看到了很多花。",
+            # Another trim:
+            "language Chinese<asr_text>很多花。",
+            "language Chinese<asr_text>很多花。真是美丽的一天。",
+        ]
+
+        deltas = asyncio.run(self._run_streaming(eng, session, responses))
+        joined = "".join(deltas)
+        assert len(joined) > 0
+        for sentence in ["今天天气真好", "我们去公园散步吧", "很多花"]:
+            count = joined.count(sentence)
+            assert count <= 1, \
+                f"Sentence '{sentence}' appears {count} times in: {joined}"
+
+    def test_model_repetition_cleaned(self):
+        """Scenario 3: Model outputs contain pattern repetition (ASR degeneration)."""
+        eng, session = self.make_engine_and_session(context_sec=0)
+
+        responses = [
+            "language Chinese<asr_text>你好",
+            "language Chinese<asr_text>你好世界" + "你好世界" * 15,  # 16x repetition
+            "language Chinese<asr_text>你好世界。今天真好",
+        ]
+
+        deltas = asyncio.run(self._run_streaming(eng, session, responses))
+        joined = "".join(deltas)
+        assert joined.count("你好世界") < 10, \
+            f"Too many '你好世界' repetitions in: {joined}"
+
+    def test_silence_produces_no_extra_deltas(self):
+        """Scenario 4: Repeated identical response should not produce spurious deltas."""
+        eng, session = self.make_engine_and_session(context_sec=0)
+
+        responses = ["language Chinese<asr_text>你好"] * 10
+
+        deltas = asyncio.run(self._run_streaming(eng, session, responses))
+        joined = "".join(deltas)
+        assert joined.count("你好") <= 2, \
+            f"'你好' repeated too many times in deltas: {joined}"
+
+    def test_long_session_output_bounded(self):
+        """Scenario 5: Long session - output length proportional to input, not runaway."""
+        eng, session = self.make_engine_and_session(context_sec=5)
+
+        base_sentences = [
+            "第一句话。", "第二句话。", "第三句话。", "第四句话。", "第五句话。",
+            "第六句话。", "第七句话。", "第八句话。", "第九句话。", "第十句话。",
+        ]
+        responses = []
+        window_text = ""
+        for i in range(20):
+            sent_idx = i % len(base_sentences)
+            if i > 0 and i % 5 == 0:
+                window_text = base_sentences[sent_idx]
+            else:
+                window_text += base_sentences[sent_idx]
+            responses.append(f"language Chinese<asr_text>{window_text}")
+
+        deltas = asyncio.run(self._run_streaming(eng, session, responses))
+        joined = "".join(deltas)
+        assert len(joined) < 500, \
+            f"Output too long ({len(joined)} chars), possible runaway repetition"
+        assert not _has_significant_repetition(joined)
