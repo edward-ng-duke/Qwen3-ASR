@@ -1,6 +1,7 @@
 """
 Tests for realtime_demo_1.py: core logic unit tests + WebSocket integration tests.
 """
+
 import asyncio
 import json
 import struct
@@ -18,8 +19,12 @@ from realtime_demo_1 import (
     ASRConfig,
     ASREngine,
     StreamingSession,
+    _append_with_overlap,
+    _compute_incremental_delta,
+    _compute_preview_text,
     _check_energy_vad,
     _common_prefix_len,
+    _merge_finalized_with_window,
     _parse_asr_output,
     _remove_output_duplicates,
     _split_at_last_sentence_boundary,
@@ -199,36 +204,65 @@ class TestSlidingWindow:
         session.append_audio(np.zeros(160000, dtype=np.float32))
         assert session._audio_len == 160000
 
-    def test_trim_resets_state(self, cfg):
+    def test_trim_preserves_call_id(self, cfg):
         session = StreamingSession(config=cfg, context_window_sec=1)
         session.call_id = 5
         session.prev_text = "previous"
         session.stable_text = "stable"
         session.append_audio(np.zeros(32000, dtype=np.float32))
-        assert session.call_id == 0
+        # call_id is NOT reset — allows fast re-stabilisation
+        assert session.call_id == 5
         assert session.prev_text == ""
         assert session.stable_text == ""
 
-    def test_trim_sets_dedup_flag(self, cfg):
+    def test_trim_resets_infer_counter(self, cfg):
         session = StreamingSession(config=cfg, context_window_sec=1)
-        session.prev_text = "some text"
         session.append_audio(np.zeros(32000, dtype=np.float32))
-        assert session._needs_dedup is True
-        assert session._pre_trim_text == "some text"
+        assert session._infer_since_trim == 0
 
-    def test_unresolved_dedup_commits_on_next_trim(self, cfg):
+    def test_trim_blocked_until_two_inferences(self, cfg):
         session = StreamingSession(config=cfg, context_window_sec=1)
-        session.prev_text = "first"
-        # First trim
+        # First trim (allowed because _infer_since_trim starts at 99)
         session.append_audio(np.zeros(32000, dtype=np.float32))
-        assert session._needs_dedup is True
-        assert session._pre_trim_text == "first"
+        assert session._audio_len == 16000  # trimmed to 1s
+        assert session._infer_since_trim == 0
 
-        session.prev_text = "second"
-        # Second trim without resolving dedup → commits first
+        # Second append — blocked (0 inferences since trim)
         session.append_audio(np.zeros(32000, dtype=np.float32))
-        assert session.finalized_text == "first"
-        assert session._pre_trim_text == "second"
+        assert session._audio_len == 48000  # NOT trimmed
+        assert session._infer_since_trim == 0
+
+    def test_trim_commits_stable_text(self, cfg):
+        session = StreamingSession(config=cfg, context_window_sec=1)
+        session.stable_text = "confirmed。"
+        session.prev_text = "confirmed。more"
+        session.append_audio(np.zeros(32000, dtype=np.float32))
+        assert "confirmed。" in session.finalized_text
+
+    def test_trim_does_not_commit_sentence_without_stable_text(self, cfg):
+        session = StreamingSession(config=cfg, context_window_sec=1)
+        session.stable_text = ""
+        session.prev_text = "unstable text。tail"
+        session.window_text = session.prev_text
+        session.append_audio(np.zeros(32000, dtype=np.float32))
+        assert session.finalized_text == ""
+
+    def test_trim_does_not_commit_fragment_without_boundary(self, cfg):
+        session = StreamingSession(config=cfg, context_window_sec=1)
+        session.stable_text = ""
+        session.prev_text = "unstable text without boundary"
+        session.window_text = session.prev_text
+        session.append_audio(np.zeros(32000, dtype=np.float32))
+        assert session.finalized_text == ""
+
+    def test_trim_merges_internal_overlap_without_duplication(self, cfg):
+        session = StreamingSession(config=cfg, context_window_sec=1)
+        session.finalized_text = "第一句。第二句。"
+        session.stable_text = "开场白。第二句。第三句。"
+        session.window_text = session.stable_text
+        session.prev_text = session.stable_text
+        session.append_audio(np.zeros(32000, dtype=np.float32))
+        assert session.finalized_text == "第一句。第二句。第三句。"
 
 
 # ===========================================================================
@@ -282,6 +316,17 @@ class TestStabilize:
         st2 = session.stable_text
         assert len(st2) >= len(st1)
 
+    def test_complete_sentence_not_rolled_back(self):
+        cfg = ASRConfig(unfixed_chunk_num=1, unfixed_token_num=5)
+        eng = ASREngine.__new__(ASREngine)
+        eng.config = cfg
+        eng._tokenizer = None
+        session = StreamingSession(config=cfg)
+
+        eng._stabilize(session, "你好世界。下一句", "zh")
+        eng._stabilize(session, "你好世界。下一句话", "zh")
+        assert session.stable_text == "你好世界。"
+
     def test_language_update(self):
         eng = self.make_engine()
         cfg = ASRConfig()
@@ -292,6 +337,19 @@ class TestStabilize:
         eng._stabilize(session, "你好", "zh")
         assert session.language == "zh"
 
+    def test_stable_prefix_reused_with_overlap_instead_of_slice(self):
+        cfg = ASRConfig(unfixed_chunk_num=0, unfixed_token_num=0)
+        eng = ASREngine.__new__(ASREngine)
+        eng.config = cfg
+        eng._tokenizer = None
+        session = StreamingSession(config=cfg)
+        session.stable_text = "你好世界"
+        session.prev_text = "你好世界和平"
+
+        eng._stabilize(session, "世界和平万岁", "zh")
+
+        assert session.window_text == "你好世界和平万岁"
+
     def test_language_not_cleared_when_empty(self):
         eng = self.make_engine()
         cfg = ASRConfig()
@@ -301,33 +359,29 @@ class TestStabilize:
         eng._stabilize(session, "hello world", "")
         assert session.language == "en"
 
-    def test_dedup_after_trim(self):
+    def test_stabilize_increments_infer_counter(self):
+        """Each _stabilize call should increment _infer_since_trim."""
+        eng = self.make_engine()
+        cfg = ASRConfig(unfixed_chunk_num=2)
+        session = StreamingSession(config=cfg)
+        session._infer_since_trim = 0
+
+        eng._stabilize(session, "hello", "en")
+        assert session._infer_since_trim == 1
+        eng._stabilize(session, "hello world", "en")
+        assert session._infer_since_trim == 2
+
+    def test_merge_with_finalized_after_trim(self):
+        """After trim, window text overlapping finalized should be deduped via substring search."""
         eng = self.make_engine()
         cfg = ASRConfig(unfixed_chunk_num=2)
         session = StreamingSession(config=cfg)
 
-        # Simulate pre-trim text
-        session._pre_trim_text = "hello world"
-        session._needs_dedup = True
+        session.finalized_text = "我们去公园散步吧。"
 
-        # New transcription with overlap: "world" is suffix of pre_trim and prefix of new
-        eng._stabilize(session, "world! How are you", "en")
-        # Should commit "hello " (pre_trim minus overlap)
-        assert session.finalized_text == "hello "
-        assert session._needs_dedup is False
-        assert "world! How are you" in session.text
-
-    def test_dedup_no_overlap(self):
-        eng = self.make_engine()
-        cfg = ASRConfig(unfixed_chunk_num=2)
-        session = StreamingSession(config=cfg)
-
-        session._pre_trim_text = "hello"
-        session._needs_dedup = True
-
-        eng._stabilize(session, "completely different", "en")
-        # No overlap → commit entire pre_trim_text
-        assert session.finalized_text == "hello"
+        eng._stabilize(session, "散步吧。路上看到了很多花。", "zh")
+        # _merge_finalized_with_window should find "散步吧。" in window text
+        assert session.text.count("散步吧") == 1
 
 
 # ===========================================================================
@@ -344,6 +398,7 @@ class TestToWav:
     def test_correct_duration(self):
         import soundfile as sf
         import io
+
         audio = np.zeros(16000, dtype=np.float32)
         wav = _to_wav(audio, sr=16000)
         data, sr = sf.read(io.BytesIO(wav))
@@ -373,6 +428,7 @@ class TestWebSocketIntegration:
 
     def get_client(self):
         from starlette.testclient import TestClient
+
         return TestClient(app)
 
     def make_audio_frame(self, n_samples=16000, value=0.0):
@@ -426,8 +482,28 @@ class TestWebSocketIntegration:
             ws.send_bytes(self.make_audio_frame())
             ws.send_json({"type": "finish"})
             data = ws.receive_json()
+            assert data["final"] is True
             assert data["language"] == "en"
             assert data["text"] == "hello world"
+
+    def test_finish_clears_incremental_fields(self):
+        """Final packet should force frontend to render from full text."""
+        self.mock_engine.transcribe = AsyncMock(
+            return_value={
+                "language": "zh",
+                "delta": "重复片段",
+                "preview": "未确认尾巴",
+                "text": "最终完整结果",
+            }
+        )
+        client = self.get_client()
+        with client.websocket_connect("/ws/asr") as ws:
+            ws.send_json({"type": "finish"})
+            data = ws.receive_json()
+            assert data["final"] is True
+            assert data["delta"] == ""
+            assert data["preview"] == ""
+            assert data["text"] == "最终完整结果"
 
     def test_config_updates_context_window(self):
         """Config message should update session's context_window_sec."""
@@ -528,6 +604,102 @@ class TestRemoveOutputDuplicates:
         assert _remove_output_duplicates("hello", "hello") == ""
 
 
+class TestComputeIncrementalDelta:
+    def test_first_emit(self):
+        assert _compute_incremental_delta("你好世界", "") == "你好世界"
+
+    def test_pure_append(self):
+        assert _compute_incremental_delta("你好世界今天", "你好世界") == "今天"
+
+    def test_shrink_does_not_reemit(self):
+        assert _compute_incremental_delta("你好", "你好世界") == ""
+
+    def test_overlap_recovery_after_trim(self):
+        emitted = "今天天气真好。我们去公园散步吧。"
+        confirmed = "我们去公园散步吧。路上看到了很多花。"
+        assert _compute_incremental_delta(confirmed, emitted) == "路上看到了很多花。"
+
+    def test_no_overlap_returns_empty(self):
+        assert _compute_incremental_delta("XYZ", "ABCDEFGHIJK") == ""
+
+    def test_short_overlap_below_threshold_returns_empty(self):
+        assert _compute_incremental_delta("abXYZ", "12ab", min_overlap=4) == ""
+
+
+class TestAppendWithOverlap:
+    def test_meaningful_overlap_deduped(self):
+        assert (
+            _append_with_overlap("我们去公园散步吧。", "散步吧。路上看到了很多花。")
+            == "我们去公园散步吧。路上看到了很多花。"
+        )
+
+    def test_single_char_overlap_preserved(self):
+        assert _append_with_overlap("哈", "哈哈", min_overlap=2) == "哈哈哈"
+
+
+class TestComputePreviewText:
+    def test_preview_only_returns_unconfirmed_tail(self):
+        full_text = "我们去公园散步吧。路上看到了很多花。"
+        confirmed = "我们去公园散步吧。"
+        assert _compute_preview_text(full_text, confirmed) == "路上看到了很多花。"
+
+    def test_preview_does_not_repeat_overlap_after_trim(self):
+        full_text = "我们去公园散步吧。我们去公园散步吧。路上看到了很多花。"
+        confirmed = "我们去公园散步吧。"
+        assert _compute_preview_text(full_text, confirmed) == "路上看到了很多花。"
+
+
+class TestMergeFinalizedWithWindow:
+    def test_suffix_prefix_fast_path(self):
+        assert (
+            _merge_finalized_with_window("我们去公园散步吧。", "散步吧。路上看到了很多花。")
+            == "我们去公园散步吧。路上看到了很多花。"
+        )
+
+    def test_internal_substring_overlap(self):
+        """Window text re-transcribes audio already in finalized — overlap is internal."""
+        finalized = "会出现各种各样的问题，所以我后来就在想说，是不是他就是脑子就"
+        window = "各种各样问题，所以我后来就在想说，是不是他就是脑子就就只有这样了？"
+        result = _merge_finalized_with_window(finalized, window)
+        # Should find "是脑子就" (or longer) as substring match
+        assert result.count("脑子就") == 1
+        assert result.endswith("就只有这样了？")
+
+    def test_repeated_phrase_prefers_latest_overlap(self):
+        finalized = "我们去公园散步吧。"
+        window = "我们去公园散步吧。我们去公园散步吧。路上看到了很多花。"
+        result = _merge_finalized_with_window(finalized, window)
+        assert result == "我们去公园散步吧。路上看到了很多花。"
+
+    def test_repeated_multi_sentence_overlap(self):
+        finalized = "第一页说完了。第二页说完了。"
+        window = "第二页说完了。第一页说完了。第二页说完了。第三页开始了。"
+        result = _merge_finalized_with_window(finalized, window)
+        assert result == "第一页说完了。第二页说完了。第三页开始了。"
+
+    def test_no_overlap_appends(self):
+        result = _merge_finalized_with_window("完全不同", "另一段文字")
+        assert result == "完全不同另一段文字"
+
+    def test_empty_finalized(self):
+        assert _merge_finalized_with_window("", "hello") == "hello"
+
+    def test_empty_window(self):
+        assert _merge_finalized_with_window("hello", "") == "hello"
+
+    def test_both_empty(self):
+        assert _merge_finalized_with_window("", "") == ""
+
+    def test_asr_variation_handled(self):
+        """ASR produces slightly different text — substring search finds overlap despite variation."""
+        finalized = "会出现各种各样的问题，是不是他就是脑子就"
+        # ASR omitted "的" in "各种各样的问题" → "各种各样问题"
+        # But tail "是脑子就" still matches
+        window = "会出现各种各样问题，是不是他就是脑子就就只有这样了？"
+        result = _merge_finalized_with_window(finalized, window)
+        assert result.count("脑子就") == 1
+
+
 class TestSplitAtLastSentenceBoundary:
     def test_chinese_period(self):
         complete, frag = _split_at_last_sentence_boundary("你好。世界")
@@ -587,15 +759,17 @@ class TestParseAsrOutputRepetition:
 # ===========================================================================
 # Part 6: E2E streaming simulation tests
 # ===========================================================================
-def _has_significant_repetition(text: str, min_pattern_len: int = 4, max_repeats: int = 3) -> bool:
+def _has_significant_repetition(
+    text: str, min_pattern_len: int = 4, max_repeats: int = 3
+) -> bool:
     """Check if text contains any pattern repeated consecutively too many times."""
     n = len(text)
     for k in range(min_pattern_len, min(n // max_repeats + 1, 30)):
         for i in range(n - k * max_repeats + 1):
-            pat = text[i:i + k]
+            pat = text[i : i + k]
             count = 1
             pos = i + k
-            while pos + k <= n and text[pos:pos + k] == pat:
+            while pos + k <= n and text[pos : pos + k] == pat:
                 count += 1
                 pos += k
             if count >= max_repeats:
@@ -612,8 +786,9 @@ class TestStreamingE2E:
     - Feeding progressive transcription results as a real model would produce
     """
 
-    def make_engine_and_session(self, context_sec=10, unfixed_chunk_num=4,
-                                unfixed_token_num=0):
+    def make_engine_and_session(
+        self, context_sec=10, unfixed_chunk_num=4, unfixed_token_num=0
+    ):
         cfg = ASRConfig(
             unfixed_chunk_num=unfixed_chunk_num,
             unfixed_token_num=unfixed_token_num,
@@ -672,8 +847,9 @@ class TestStreamingE2E:
         deltas = asyncio.run(self._run_streaming(eng, session, responses))
         joined = "".join(deltas)
         assert len(joined) > 0, "Should have produced some output"
-        assert not _has_significant_repetition(joined), \
+        assert not _has_significant_repetition(joined), (
             f"Repetition detected in delta output: {joined[:200]}..."
+        )
 
     def test_sliding_window_no_repetition(self):
         """Scenario 2: Window trim triggers cross-window dedup."""
@@ -697,8 +873,9 @@ class TestStreamingE2E:
         assert len(joined) > 0
         for sentence in ["今天天气真好", "我们去公园散步吧", "很多花"]:
             count = joined.count(sentence)
-            assert count <= 1, \
+            assert count <= 1, (
                 f"Sentence '{sentence}' appears {count} times in: {joined}"
+            )
 
     def test_model_repetition_cleaned(self):
         """Scenario 3: Model outputs contain pattern repetition (ASR degeneration)."""
@@ -712,8 +889,9 @@ class TestStreamingE2E:
 
         deltas = asyncio.run(self._run_streaming(eng, session, responses))
         joined = "".join(deltas)
-        assert joined.count("你好世界") < 10, \
+        assert joined.count("你好世界") < 10, (
             f"Too many '你好世界' repetitions in: {joined}"
+        )
 
     def test_silence_produces_no_extra_deltas(self):
         """Scenario 4: Repeated identical response should not produce spurious deltas."""
@@ -723,16 +901,43 @@ class TestStreamingE2E:
 
         deltas = asyncio.run(self._run_streaming(eng, session, responses))
         joined = "".join(deltas)
-        assert joined.count("你好") <= 2, \
+        assert joined.count("你好") <= 2, (
             f"'你好' repeated too many times in deltas: {joined}"
+        )
+
+    def test_repeated_window_phrase_not_reemitted(self):
+        """Scenario 5: repeated overlap in the retained window should not re-emit old text."""
+        eng, session = self.make_engine_and_session(
+            context_sec=10, unfixed_chunk_num=0, unfixed_token_num=0
+        )
+        repeated = "我们去公园散步吧。我们去公园散步吧。路上看到了很多花。"
+        self._setup_responses(eng, [f"language Chinese<asr_text>{repeated}"])
+
+        session.finalized_text = "我们去公园散步吧。"
+        session._emitted_text = "我们去公园散步吧。"
+        session.prev_text = repeated
+        session.append_audio(np.random.randn(16000).astype(np.float32) * 0.1)
+
+        result = asyncio.run(eng.transcribe(session))
+        assert result["confirmed"] == "我们去公园散步吧。路上看到了很多花。"
+        assert result["delta"] == "路上看到了很多花。"
+        assert result["preview"] == ""
 
     def test_long_session_output_bounded(self):
-        """Scenario 5: Long session - output length proportional to input, not runaway."""
+        """Scenario 6: Long session - output length proportional to input, not runaway."""
         eng, session = self.make_engine_and_session(context_sec=5)
 
         base_sentences = [
-            "第一句话。", "第二句话。", "第三句话。", "第四句话。", "第五句话。",
-            "第六句话。", "第七句话。", "第八句话。", "第九句话。", "第十句话。",
+            "第一句话。",
+            "第二句话。",
+            "第三句话。",
+            "第四句话。",
+            "第五句话。",
+            "第六句话。",
+            "第七句话。",
+            "第八句话。",
+            "第九句话。",
+            "第十句话。",
         ]
         responses = []
         window_text = ""
@@ -746,6 +951,7 @@ class TestStreamingE2E:
 
         deltas = asyncio.run(self._run_streaming(eng, session, responses))
         joined = "".join(deltas)
-        assert len(joined) < 500, \
+        assert len(joined) < 500, (
             f"Output too long ({len(joined)} chars), possible runaway repetition"
+        )
         assert not _has_significant_repetition(joined)

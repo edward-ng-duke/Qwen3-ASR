@@ -18,6 +18,7 @@ Open: http://localhost:6860 (or https:// with SSL)
 
 import argparse
 import asyncio
+from difflib import SequenceMatcher
 import io
 import json
 import logging
@@ -25,7 +26,7 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import soundfile as sf
@@ -35,9 +36,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 import websockets
 from openai import AsyncOpenAI
 
-from qwen_asr.inference.utils import detect_and_fix_repetitions
 
 logger = logging.getLogger("asr")
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -69,21 +70,28 @@ class ASRConfig:
 # ---------------------------------------------------------------------------
 SENTENCE_TERMINATORS = set("。！？.!?\n")
 
+
+@dataclass(frozen=True)
+class TranscriptSnapshot:
+    confirmed: str
+    preview: str
+    full_text: str
+
+
 @dataclass
 class StreamingSession:
     config: ASRConfig
+    session_id: int = 0
     call_id: int = 0
     stable_text: str = ""
     prev_text: str = ""
     language: str = ""
     text: str = ""
+    window_text: str = ""
     finalized_text: str = ""
     context_window_sec: int = 10
-    _pre_trim_text: str = ""
-    _needs_dedup: bool = False
-    _last_sent_len: int = 0
-    _current_window_text: str = ""
-    _recent_confirmed: str = ""
+    _infer_since_trim: int = 99  # large initial value so first trim isn't blocked
+    _emitted_text: str = ""
     _vad_speech_active: bool = False
     _vad_ever_had_speech: bool = False
     _vad_chunks_since_speech_end: int = 0
@@ -120,38 +128,121 @@ class StreamingSession:
     def _apply_sliding_window(self) -> None:
         if self.context_window_sec <= 0:
             return
+        # Need at least 2 inferences between trims so that common-prefix
+        # stabilisation can work (requires prev_text from a prior inference).
+        if self._infer_since_trim < 2:
+            return
         max_samples = self.context_window_sec * self.config.sample_rate
         if self._audio_len <= max_samples:
             return
 
-        # If previous trim's dedup wasn't resolved yet, commit it now
-        if self._needs_dedup and self._pre_trim_text:
-            self.finalized_text += self._pre_trim_text
-            self._pre_trim_text = ""
+        pre_len = self._audio_len
 
-        # Sentence-aware: commit complete sentences directly, only
-        # the trailing fragment needs cross-window dedup
-        current_text = self.prev_text or self.stable_text or ""
-        complete, fragment = _split_at_last_sentence_boundary(current_text)
-        if complete:
-            self.finalized_text += complete
-        self._pre_trim_text = fragment
-        self._needs_dedup = bool(self._pre_trim_text)
+        # Commit only the trustworthy stable prefix before trimming. Keep the
+        # full-sentence candidate in logs for diagnosis, but do not freeze it
+        # into finalized_text until the stabiliser has actually confirmed it.
+        current_text = self.window_text or self.prev_text or self.stable_text
+        complete_sentences = ""
+        if current_text:
+            complete_sentences, _ = _split_at_last_sentence_boundary(current_text)
+        commit_text = self.stable_text
+        commit_source = "stable" if commit_text else "none"
+        if commit_text:
+            self.finalized_text = _merge_finalized_with_window(
+                self.finalized_text, commit_text
+            )
+
+        logger.info(
+            f"[session:{self.session_id}][trim] audio={pre_len / self.config.sample_rate:.1f}s->"
+            f"{max_samples / self.config.sample_rate:.1f}s commit={commit_source}:{len(commit_text)} "
+            f"stable={len(self.stable_text)} sentence_candidate={len(complete_sentences)} "
+            f"finalized={len(self.finalized_text)} commit_text={_log_excerpt(commit_text)} "
+            f"sentence_text={_log_excerpt(complete_sentences)}"
+        )
 
         self._set_audio(self.audio_accum[-max_samples:])
-        self.call_id = 0
+        # Keep call_id — allows fast re-stabilisation after trim
         self.prev_text = ""
         self.stable_text = ""
+        self.window_text = ""
+        self.text = self.finalized_text
+        self._infer_since_trim = 0
 
 
 # ---------------------------------------------------------------------------
 # ASR helpers
 # ---------------------------------------------------------------------------
+def detect_and_fix_repetitions(text, threshold=20):
+    """Collapse excessive character/pattern repetitions in ASR output.
+
+    Ported from qwen_asr/inference/utils.py to keep this file self-contained.
+    """
+    def fix_char_repeats(s, thresh):
+        res = []
+        i = 0
+        n = len(s)
+        while i < n:
+            count = 1
+            while i + count < n and s[i + count] == s[i]:
+                count += 1
+            if count > thresh:
+                res.append(s[i])
+                i += count
+            else:
+                res.append(s[i:i+count])
+                i += count
+        return ''.join(res)
+
+    def fix_pattern_repeats(s, thresh, max_len=20):
+        n = len(s)
+        min_repeat_chars = thresh * 2
+        if n < min_repeat_chars:
+            return s
+        i = 0
+        result = []
+        found = False
+        while i <= n - min_repeat_chars:
+            found = False
+            for k in range(1, max_len + 1):
+                if i + k * thresh > n:
+                    break
+                pattern = s[i:i+k]
+                valid = True
+                for rep in range(1, thresh):
+                    start_idx = i + rep * k
+                    if s[start_idx:start_idx+k] != pattern:
+                        valid = False
+                        break
+                if valid:
+                    total_rep = thresh
+                    end_index = i + thresh * k
+                    while end_index + k <= n and s[end_index:end_index+k] == pattern:
+                        total_rep += 1
+                        end_index += k
+                    result.append(pattern)
+                    result.append(fix_pattern_repeats(s[end_index:], thresh, max_len))
+                    i = n
+                    found = True
+                    break
+            if found:
+                break
+            else:
+                result.append(s[i])
+                i += 1
+        if not found:
+            result.append(s[i:])
+        return ''.join(result)
+
+    text = fix_char_repeats(text, threshold)
+    text = fix_pattern_repeats(text, threshold)
+    return text
+
+
 def _check_energy_vad(chunk: np.ndarray, threshold: float = 0.01) -> bool:
     """Return True if audio chunk RMS exceeds silence threshold."""
     if chunk.shape[0] == 0:
         return False
-    return float(np.sqrt(np.mean(chunk ** 2))) > threshold
+    return float(np.sqrt(np.mean(chunk**2))) > threshold
 
 
 _ASR_TEXT_TAG = "<asr_text>"
@@ -171,6 +262,16 @@ def _parse_asr_output(raw: str, repetition_threshold: int = 10) -> tuple:
             lang = m.group(1)
         return lang, text.strip()
     return "", s
+
+
+def _log_excerpt(text: str, limit: int = 48) -> str:
+    if not text:
+        return "-"
+    s = text.replace("\n", r"\n")
+    if len(s) <= limit:
+        return s
+    edge = max(12, (limit - 3) // 2)
+    return f"{s[:edge]}...{s[-edge:]}"
 
 
 def _common_prefix_len(a: str, b: str) -> int:
@@ -201,6 +302,110 @@ def _remove_output_duplicates(delta: str, recent: str, min_match_len: int = 4) -
     return delta
 
 
+def _compute_incremental_delta(
+    confirmed: str, emitted: str, min_overlap: int = 4
+) -> str:
+    if not confirmed:
+        return ""
+    if not emitted:
+        return confirmed
+    if confirmed.startswith(emitted):
+        return confirmed[len(emitted) :]
+    if emitted.startswith(confirmed):
+        return ""
+    overlap = _suffix_prefix_overlap(emitted, confirmed)
+    if overlap >= min_overlap:
+        return confirmed[overlap:]
+    return ""
+
+
+def _append_with_overlap(base: str, addition: str, min_overlap: int = 2) -> str:
+    if not addition:
+        return base
+    overlap = _suffix_prefix_overlap(base, addition)
+    if overlap >= min_overlap:
+        return base + addition[overlap:]
+    return base + addition
+
+
+def _ensure_text_starts_with_prefix(text: str, prefix: str, min_overlap: int = 2) -> str:
+    if not prefix:
+        return text
+    if not text:
+        return prefix
+    if text.startswith(prefix):
+        return text
+    if prefix.startswith(text):
+        return prefix
+    overlap = _suffix_prefix_overlap(prefix, text)
+    if overlap >= min_overlap:
+        return prefix + text[overlap:]
+    return prefix + text
+
+
+def _compute_preview_text(full_text: str, confirmed: str, min_overlap: int = 4) -> str:
+    if not full_text:
+        return ""
+    if not confirmed:
+        return full_text
+    merged = _merge_finalized_with_window(confirmed, full_text, min_match=min_overlap)
+    if merged.startswith(confirmed):
+        return merged[len(confirmed) :]
+    if confirmed.startswith(merged):
+        return ""
+    overlap = _suffix_prefix_overlap(confirmed, merged)
+    if overlap >= min_overlap:
+        return merged[overlap:]
+    return merged
+
+
+def _build_transcript_snapshot(
+    finalized_text: str, stable_text: str, window_text: str
+) -> TranscriptSnapshot:
+    confirmed = _merge_finalized_with_window(finalized_text, stable_text)
+    full_text = _merge_finalized_with_window(finalized_text, window_text)
+    preview = _compute_preview_text(full_text, confirmed)
+    return TranscriptSnapshot(
+        confirmed=confirmed,
+        preview=preview,
+        full_text=full_text,
+    )
+
+
+def _merge_finalized_with_window(
+    finalized: str, window_text: str, min_match: int = 4
+) -> str:
+    """Merge committed text with a current window transcript."""
+    if not finalized or not window_text:
+        return finalized + window_text
+
+    max_tail = min(len(finalized), 40)
+    for length in range(max_tail, min_match - 1, -1):
+        tail = finalized[-length:]
+        idx = window_text.rfind(tail)
+        if idx >= 0:
+            return finalized + window_text[idx + length:]
+
+    tail = finalized[-min(len(finalized), 160) :]
+    suffix_slack = 12
+    best_block = None
+    best_score = None
+    for block in SequenceMatcher(None, tail, window_text, autojunk=False).get_matching_blocks():
+        if block.size < max(min_match, 8):
+            continue
+        tail_end = block.a + block.size
+        if tail_end < len(tail) - suffix_slack:
+            continue
+        score = (tail_end, block.size, block.b)
+        if best_score is None or score > best_score:
+            best_block = block
+            best_score = score
+    if best_block is not None:
+        return finalized + window_text[best_block.b + best_block.size :]
+
+    return finalized + window_text
+
+
 def _split_at_last_sentence_boundary(text: str) -> tuple[str, str]:
     """Split text into (complete_sentences, trailing_fragment).
 
@@ -209,8 +414,9 @@ def _split_at_last_sentence_boundary(text: str) -> tuple[str, str]:
     """
     for i in range(len(text) - 1, -1, -1):
         if text[i] in SENTENCE_TERMINATORS:
-            return text[:i + 1], text[i + 1:]
+            return text[: i + 1], text[i + 1 :]
     return "", text
+
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +432,7 @@ class ASREngine:
             tokenizer_path = config.tokenizer_path or config.model
             try:
                 from transformers import AutoTokenizer
+
                 self._tokenizer = AutoTokenizer.from_pretrained(
                     tokenizer_path, trust_remote_code=True
                 )
@@ -248,7 +455,7 @@ class ASREngine:
                 if end_idx == 0:
                     return ""
                 rolled = self._tokenizer.decode(token_ids[:end_idx])
-                if '\ufffd' not in rolled:
+                if "\ufffd" not in rolled:
                     return rolled
                 k += 1
         else:
@@ -259,8 +466,20 @@ class ASREngine:
 
     async def transcribe(self, session: StreamingSession) -> dict:
         if session.audio_accum.shape[0] == 0:
-            return {"language": session.language, "delta": "", "preview": "", "text": session.text}
+            snapshot = _build_transcript_snapshot(
+                session.finalized_text, session.stable_text, session.window_text
+            )
+            session.text = snapshot.full_text
+            return {
+                "final": False,
+                "language": session.language,
+                "confirmed": snapshot.confirmed,
+                "delta": "",
+                "preview": snapshot.preview,
+                "text": snapshot.full_text,
+            }
 
+        audio_sec = session.audio_duration_sec
         wav_bytes = _to_wav(session.audio_accum)
         async with self._semaphore:
             try:
@@ -275,56 +494,77 @@ class ASREngine:
 
         language, text = _parse_asr_output(raw, self.config.repetition_threshold)
         self._stabilize(session, text, language)
+        snapshot = _build_transcript_snapshot(
+            session.finalized_text, session.stable_text, session.window_text
+        )
+        session.text = snapshot.full_text
 
-        # Compute incremental output
-        confirmed = session.finalized_text + session.stable_text
-        delta = confirmed[session._last_sent_len:]
-        # Output-level dedup guard: remove prefix of delta that duplicates recent output
+        delta = _compute_incremental_delta(snapshot.confirmed, session._emitted_text)
+        if delta and session.finalized_text and session._infer_since_trim <= 3:
+            recent_emitted = session._emitted_text[-200:]
+            deduped = _remove_output_duplicates(delta, recent_emitted)
+            if deduped != delta:
+                delta = deduped
         if delta:
-            delta = _remove_output_duplicates(delta, session._recent_confirmed)
-        if delta:
-            session._recent_confirmed = (session._recent_confirmed + delta)[-200:]
-        window_text = session._current_window_text
-        preview = window_text[len(session.stable_text):] if len(window_text) > len(session.stable_text) else ""
-        session._last_sent_len = len(confirmed)
+            session._emitted_text += delta
 
+        logger.info(
+            f"[session:{session.session_id}][text] call={session.call_id} audio={audio_sec:.1f}s "
+            f"stable={len(session.stable_text)} finalized={len(session.finalized_text)} "
+            f"window={len(session.window_text)} confirmed={len(snapshot.confirmed)} "
+            f"delta={len(delta)} preview={len(snapshot.preview)} "
+            f"stable_text={_log_excerpt(session.stable_text)} "
+            f"confirmed_text={_log_excerpt(snapshot.confirmed)} "
+            f"preview_text={_log_excerpt(snapshot.preview)}"
+        )
         return {
+            "final": False,
             "language": session.language,
+            "confirmed": snapshot.confirmed,
             "delta": delta,
-            "preview": preview,
-            "text": session.text,
+            "preview": snapshot.preview,
+            "text": snapshot.full_text,
         }
 
     def _stabilize(self, session: StreamingSession, text: str, language: str):
         session.call_id += 1
+        session._infer_since_trim += 1
         if session.call_id > self.config.unfixed_chunk_num and session.prev_text:
             cp = _common_prefix_len(session.prev_text, text)
             if cp > len(session.stable_text):
                 candidate = text[:cp]
+                candidate_source = "prefix"
                 if self.config.unfixed_token_num > 0:
-                    candidate = self._rollback_tokens(
-                        candidate, self.config.unfixed_token_num
+                    trusted_prefix = (
+                        session.stable_text if candidate.startswith(session.stable_text) else ""
                     )
+                    new_tail = candidate[len(trusted_prefix) :]
+                    rolled_candidate = trusted_prefix + self._rollback_tokens(
+                        new_tail, self.config.unfixed_token_num
+                    )
+                    complete_candidate, _ = _split_at_last_sentence_boundary(candidate)
+                    if len(complete_candidate) > len(rolled_candidate):
+                        candidate = complete_candidate
+                        candidate_source = "sentence"
+                    else:
+                        candidate = rolled_candidate
+                        candidate_source = "rollback"
                 if len(candidate) > len(session.stable_text):
                     session.stable_text = candidate
+                    logger.info(
+                        f"[session:{session.session_id}][stable] call={session.call_id} cp={cp} "
+                        f"source={candidate_source} stable={len(session.stable_text)} "
+                        f"stable_text={_log_excerpt(session.stable_text)} "
+                        f"prev_text={_log_excerpt(session.prev_text)} curr_text={_log_excerpt(text)}"
+                    )
             if not text.startswith(session.stable_text):
-                text = session.stable_text + text[len(session.stable_text):]
-
-        # Resolve dedup after first post-trim transcription
-        if session._needs_dedup and session._pre_trim_text:
-            overlap = _suffix_prefix_overlap(session._pre_trim_text, text)
-            committed = session._pre_trim_text
-            if overlap > 0:
-                committed = session._pre_trim_text[:-overlap]
-            session.finalized_text += committed
-            session._needs_dedup = False
-            session._pre_trim_text = ""
+                text = _ensure_text_starts_with_prefix(text, session.stable_text)
 
         session.prev_text = text
         if language:
             session.language = language
-        session.text = session.finalized_text + text
-        session._current_window_text = text
+        session.window_text = text
+        session.text = _merge_finalized_with_window(session.finalized_text, text)
 
     async def close(self):
         await self.client.close()
@@ -390,17 +630,17 @@ async def audio_processor_js():
 
 @app.get("/metrics")
 async def get_metrics():
-    avg_latency = (
-        metrics.infer_latency_sum / max(metrics.total_infer_calls, 1) * 1000
+    avg_latency = metrics.infer_latency_sum / max(metrics.total_infer_calls, 1) * 1000
+    return JSONResponse(
+        {
+            "active_sessions": metrics.active_sessions,
+            "total_sessions": metrics.total_sessions,
+            "total_infer_calls": metrics.total_infer_calls,
+            "total_infer_errors": metrics.total_infer_errors,
+            "avg_infer_latency_ms": round(avg_latency, 1),
+            "audio_hours_processed": round(metrics.audio_duration_processed / 3600, 3),
+        }
     )
-    return JSONResponse({
-        "active_sessions": metrics.active_sessions,
-        "total_sessions": metrics.total_sessions,
-        "total_infer_calls": metrics.total_infer_calls,
-        "total_infer_errors": metrics.total_infer_errors,
-        "avg_infer_latency_ms": round(avg_latency, 1),
-        "audio_hours_processed": round(metrics.audio_duration_processed / 3600, 3),
-    })
 
 
 @app.websocket("/ws/asr")
@@ -425,22 +665,35 @@ async def ws_asr(ws: WebSocket):
 
     metrics.active_sessions += 1
     metrics.total_sessions += 1
+    sid = metrics.total_sessions
+    session.session_id = sid
+    logger.info(
+        f"[session:{sid}] new connection: chunk_ms={config.chunk_ms} "
+        f"context_window={session.context_window_sec}s"
+    )
 
     # Connect to external VAD service
     vad_ws = None
     if not config.vad_url:
-        logger.info(f"External VAD disabled, using energy VAD (threshold={config.energy_vad_threshold})")
+        logger.info(
+            f"External VAD disabled, using energy VAD (threshold={config.energy_vad_threshold})"
+        )
     if config.vad_url:
         try:
             vad_ws = await websockets.connect(
                 f"{config.vad_url}/vad_realtime_ws",
                 open_timeout=5,
+                additional_headers={"Origin": config.vad_url},
             )
-            await vad_ws.send(json.dumps({
-                "type": "init",
-                "sample_rate": config.sample_rate,
-                "chunk_size_ms": config.chunk_ms,
-            }))
+            await vad_ws.send(
+                json.dumps(
+                    {
+                        "type": "init",
+                        "sample_rate": config.sample_rate,
+                        "chunk_size_ms": config.chunk_ms,
+                    }
+                )
+            )
             init_resp = json.loads(await vad_ws.recv())
             if init_resp.get("status") != "initialized":
                 logger.warning("VAD init failed, falling back to energy VAD")
@@ -449,7 +702,9 @@ async def ws_asr(ws: WebSocket):
             else:
                 logger.info(f"External VAD connected: {config.vad_url}")
         except Exception as e:
-            logger.warning(f"External VAD unavailable ({e}), falling back to energy VAD (threshold={config.energy_vad_threshold})")
+            logger.warning(
+                f"External VAD unavailable ({e}), falling back to energy VAD (threshold={config.energy_vad_threshold})"
+            )
             vad_ws = None
 
     timeout_event = asyncio.Event()
@@ -458,7 +713,7 @@ async def ws_asr(ws: WebSocket):
         while True:
             await asyncio.sleep(30)
             if time.monotonic() - last_activity > timeout_sec:
-                logger.info("Session timeout, signaling close")
+                logger.info(f"[session:{sid}] timeout, signaling close")
                 timeout_event.set()
                 return
 
@@ -506,7 +761,12 @@ async def ws_asr(ws: WebSocket):
                 # VAD: forward audio to external VAD service
                 if vad_ws:
                     try:
-                        int16_bytes = (chunk * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+                        int16_bytes = (
+                            (chunk * 32767)
+                            .clip(-32768, 32767)
+                            .astype(np.int16)
+                            .tobytes()
+                        )
                         await vad_ws.send(int16_bytes)
                         vad_resp = json.loads(await vad_ws.recv())
                         if vad_resp.get("status") == "detected":
@@ -523,7 +783,9 @@ async def ws_asr(ws: WebSocket):
                         elif not session._vad_speech_active:
                             session._vad_chunks_since_speech_end += 1
                     except Exception as e:
-                        logger.warning(f"VAD error: {e}, disabling VAD for this session")
+                        logger.warning(
+                            f"VAD error: {e}, disabling VAD for this session"
+                        )
                         vad_ws = None
 
                 # Check max duration (unlimited mode)
@@ -537,10 +799,9 @@ async def ws_asr(ws: WebSocket):
                 # Inference throttling: only infer when previous done + interval elapsed
                 now = time.monotonic()
                 if vad_ws:
-                    should_infer = (
-                        session._vad_speech_active
-                        or (session._vad_ever_had_speech
-                            and session._vad_chunks_since_speech_end <= 3)
+                    should_infer = session._vad_speech_active or (
+                        session._vad_ever_had_speech
+                        and session._vad_chunks_since_speech_end <= 3
                     )
                 else:
                     # No external VAD → use energy-based fallback
@@ -558,8 +819,10 @@ async def ws_asr(ws: WebSocket):
                         session._energy_speech_active
                         or session._vad_chunks_since_speech_end <= 3
                     )
-                if should_infer and (infer_task is None or infer_task.done()) and (
-                    now - last_infer_time >= min_infer_interval
+                if (
+                    should_infer
+                    and (infer_task is None or infer_task.done())
+                    and (now - last_infer_time >= min_infer_interval)
                 ):
                     last_infer_time = now
                     infer_task = asyncio.create_task(
@@ -576,9 +839,17 @@ async def ws_asr(ws: WebSocket):
                 msg_type = ctrl.get("type", "")
 
                 if msg_type == "config":
-                    session.context_window_sec = int(ctrl.get("context_sec", 10))
+                    new_ctx = int(ctrl.get("context_sec", 10))
+                    if new_ctx != session.context_window_sec:
+                        logger.info(f"[session:{sid}] context_window {session.context_window_sec}s -> {new_ctx}s")
+                    session.context_window_sec = new_ctx
 
                 elif msg_type == "finish":
+                    logger.info(
+                        f"[session:{sid}] finish requested, "
+                        f"audio={session.audio_duration_sec:.1f}s "
+                        f"calls={session.call_id}"
+                    )
                     # Cancel any in-flight inference to avoid concurrent session mutation
                     if infer_task and not infer_task.done():
                         infer_task.cancel()
@@ -588,14 +859,25 @@ async def ws_asr(ws: WebSocket):
                             pass
                     # Final transcription
                     result = await engine.transcribe(session)
+                    result["final"] = True
+                    result["delta"] = ""
+                    result["preview"] = ""
+                    logger.info(
+                        f"[session:{sid}] final result len={len(result.get('text',''))} "
+                        f"text={_log_excerpt(result.get('text', ''))}"
+                    )
                     await ws.send_json(result)
                     break
 
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
+        logger.info(f"[session:{sid}] client disconnected")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"[session:{sid}] WebSocket error: {e}", exc_info=True)
     finally:
+        logger.info(
+            f"[session:{sid}] cleanup: audio={session.audio_duration_sec:.1f}s "
+            f"calls={session.call_id} text_len={len(session.text)}"
+        )
         metrics.active_sessions -= 1
         watchdog_task.cancel()
         if infer_task and not infer_task.done():
@@ -609,9 +891,7 @@ async def ws_asr(ws: WebSocket):
             await vad_ws.close()
 
 
-async def _do_infer_and_send(
-    eng: ASREngine, session: StreamingSession, ws: WebSocket
-):
+async def _do_infer_and_send(eng: ASREngine, session: StreamingSession, ws: WebSocket):
     t0 = time.monotonic()
     try:
         result = await eng.transcribe(session)
@@ -620,13 +900,17 @@ async def _do_infer_and_send(
         metrics.infer_latency_sum += elapsed
         metrics.audio_duration_processed += session.audio_duration_sec
         rtf = elapsed / max(session.audio_duration_sec, 0.001)
-        logger.debug(
-            f"infer latency={elapsed*1000:.0f}ms audio={session.audio_duration_sec:.1f}s rtf={rtf:.3f}"
+        d, p = len(result.get("delta", "")), len(result.get("preview", ""))
+        c = len(result.get("confirmed", ""))
+        logger.info(
+            f"[session:{session.session_id}][infer] #{metrics.total_infer_calls} "
+            f"latency={elapsed*1000:.0f}ms audio={session.audio_duration_sec:.1f}s "
+            f"rtf={rtf:.3f} confirmed={c} delta={d} preview={p}"
         )
         await ws.send_json(result)
     except Exception as e:
         metrics.total_infer_errors += 1
-        logger.error(f"Infer/send error: {e}")
+        logger.error(f"Infer/send error: {e}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -860,21 +1144,21 @@ INDEX_HTML = r"""<!doctype html>
             return;
           }
           if (data.language) langEl.textContent = data.language;
-          // Incremental display: append confirmed delta, show preview temporarily
-          if (data.delta) {
+          if (data.final) {
             const oldPreview = textEl.querySelector(".preview");
             if (oldPreview) oldPreview.remove();
-            textEl.appendChild(document.createTextNode(data.delta));
+            textEl.textContent = data.text || "";
+            textEl.scrollTop = textEl.scrollHeight;
+            if (finishResolver) { finishResolver(); finishResolver = null; }
+            return;
           }
-          {
-            const oldPreview = textEl.querySelector(".preview");
-            if (oldPreview) oldPreview.remove();
-            if (data.preview) {
-              const ps = document.createElement("span");
-              ps.className = "preview";
-              ps.textContent = data.preview;
-              textEl.appendChild(ps);
-            }
+          const confirmed = data.confirmed || data.text || "";
+          textEl.textContent = confirmed;
+          if (data.preview) {
+            const ps = document.createElement("span");
+            ps.className = "preview";
+            ps.textContent = data.preview;
+            textEl.appendChild(ps);
           }
           textEl.scrollTop = textEl.scrollHeight;
           if (finishResolver) { finishResolver(); finishResolver = null; }
@@ -1083,6 +1367,12 @@ def parse_args():
         default=10,
         help="Pattern repeat count threshold for repetition detection (0 to disable)",
     )
+    p.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Application log level",
+    )
     p.add_argument("--ssl-certfile", default=None, help="SSL cert file")
     p.add_argument("--ssl-keyfile", default=None, help="SSL key file")
     return p.parse_args()
@@ -1090,6 +1380,15 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(asctime)s %(levelname)-7s %(name)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
     global config
     config = ASRConfig(
@@ -1136,7 +1435,9 @@ def main():
     print(f"vLLM server: {args.base_url}")
     print(f"Model:       {args.model}")
     print(f"Chunk:       {args.chunk_ms}ms")
-    print(f"Stabilize:   unfixed_chunk={config.unfixed_chunk_num}, unfixed_token={config.unfixed_token_num}")
+    print(
+        f"Stabilize:   unfixed_chunk={config.unfixed_chunk_num}, unfixed_token={config.unfixed_token_num}"
+    )
     print(f"VAD:         {config.vad_url or 'disabled'}")
     print(f"Listening:   {proto}://{args.host}:{args.port}")
 
