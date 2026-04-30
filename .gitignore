@@ -29,7 +29,11 @@ env/
 # Large files / local data
 models/
 data/
+*.tar.gz
 
 # Temp scripts
 temp.sh
 requirements_weiqu.txt
+
+# Local notes
+claude.md
