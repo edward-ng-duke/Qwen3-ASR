@@ -1,0 +1,55 @@
+name: qwen3-asr-hotword
+
+services:
+  asr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mygpt-qwen3-asr-hotword:v1.2.2
+    container_name: qwen3-asr-hotword
+    restart: unless-stopped
+    gpus: all
+    shm_size: 4gb
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      ASR_PORT: "8000"
+      ASR_ATTENTION_BACKEND: "auto"
+      ASR_TORCH_COMPILE: "0"
+      ASR_TORCH_COMPILE_MODE: "default"
+      ASR_WARMUP: "1"
+      ASR_REALTIME_FIRST_UPDATE_SECONDS: "${ASR_REALTIME_FIRST_UPDATE_SECONDS:-0.5}"
+      ASR_REALTIME_UPDATE_SECONDS: "${ASR_REALTIME_UPDATE_SECONDS:-1.0}"
+      ASR_FALLBACK_VAD_THRESHOLD: "0.1"
+      ASR_CANDIDATE_MIN_RMS: "0.0015"
+      ASR_PROMPT_VERIFICATION_MIN_AGREEMENT: "0.45"
+      ASR_API_KEY: "${ASR_API_KEY:-}"
+      TORCHINDUCTOR_CACHE_DIR: "/var/lib/qwen3-asr/torchinductor/default"
+    volumes:
+      - qwen3_asr_state:/var/lib/qwen3-asr
+    networks:
+      - offline
+
+  gateway:
+    image: mygpt-qwen3-asr-hotword:v1.2.2
+    container_name: qwen3-asr-hotword-gateway
+    restart: unless-stopped
+    entrypoint: ["python", "/opt/qwen3-asr-hotword/scripts/tcp_proxy.py"]
+    command: ["--listen-port", "8000", "--upstream-host", "asr", "--upstream-port", "8000"]
+    depends_on:
+      - asr
+    ports:
+      - "6002:8000"
+    networks:
+      - edge
+      - offline
+
+volumes:
+  qwen3_asr_state:
+    name: qwen3-asr-hotword-state
+
+networks:
+  edge:
+    name: qwen3-asr-hotword-edge
+  offline:
+    name: qwen3-asr-hotword-offline
+    internal: true

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "samples": [
+    {
+      "filename": "mr_quilter.wav",
+      "url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav",
+      "sha256": "799f78ed4beb4de7ceae3a809262d4ce242394342ccd1d58cef7d49dbc2def46",
+      "language": "en",
+      "reference": "Mr Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.",
+      "hotwords": ["Quilter", "apostle", "gospel"],
+      "source_page": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf",
+      "license": "LibriVox recording / public-domain source text; distributed as the official Qwen3-ASR model-card example"
+    },
+    {
+      "filename": "zh_wikipedia_cc0.oga",
+      "url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Zh%2C%20cmn%2C%20bjjg%2C%20%E7%BB%B4%E5%9F%BA%E7%99%BE%E7%A7%91%2C%20%E8%87%AA%E7%94%B1%E7%9A%84%E7%99%BE%E7%A7%91%E5%85%A8%E4%B9%A6.oga",
+      "sha256": "dce20db102bbadb495877e6730b4f594a55cd3d0725b9747c46354ef8ef2a4a5",
+      "language": "zh",
+      "reference": "维基百科，自由的百科全书。",
+      "hotwords": ["维基百科", "百科全书"],
+      "source_page": "https://commons.wikimedia.org/wiki/File:Zh,_cmn,_bjjg,_%E7%BB%B4%E5%9F%BA%E7%99%BE%E7%A7%91,_%E8%87%AA%E7%94%B1%E7%9A%84%E7%99%BE%E7%A7%91%E5%85%A8%E4%B9%A6.oga",
+      "license": "CC0 1.0 Universal public-domain dedication",
+      "attribution": "妖妖倍儿灵; uploaded by Ngguls"
+    }
+  ]
+}

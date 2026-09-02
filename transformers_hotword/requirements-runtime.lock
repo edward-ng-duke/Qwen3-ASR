@@ -1,0 +1,13 @@
+# Direct runtime dependencies. PyTorch, CUDA, torchaudio and flash-attn are inherited
+# from the digest-pinned official Qwen image so their compiled ABI stays intact.
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+python-multipart==0.0.32
+prometheus-client==0.26.0
+silero-vad==6.2.1
+onnxruntime==1.23.2
+soxr==1.1.0
+soundfile==0.14.0
+httpx==0.28.1
+websockets==16.1.1
+huggingface-hub==1.26.0
