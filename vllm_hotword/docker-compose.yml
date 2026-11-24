@@ -1,0 +1,87 @@
+name: qwen3-asr-vllm-hotword
+
+services:
+  asr-engine:
+    build:
+      context: ..
+      dockerfile: vllm_hotword/Dockerfile
+    image: mygpt-qwen3-asr:v1.2.2
+    container_name: mygpt-qwen3-asr-engine
+    restart: unless-stopped
+    entrypoint: ["vllm", "serve"]
+    command:
+      - /opt/models/Qwen3-ASR-1.7B
+      - --served-model-name
+      - Qwen/Qwen3-ASR-1.7B
+      - --gpu-memory-utilization
+      - "0.30"
+      - --max-model-len
+      - "4096"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    gpus: all
+    shm_size: 4gb
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+    volumes:
+      - qwen3_asr_vllm_state:/var/lib/qwen3-asr
+    networks:
+      - offline
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10m
+      retries: 4
+
+  gateway:
+    image: mygpt-qwen3-asr:v1.2.2
+    container_name: mygpt-qwen3-asr
+    restart: unless-stopped
+    entrypoint: ["python3", "-m", "vllm_hotword.app.main"]
+    depends_on:
+      asr-engine:
+        condition: service_healthy
+    environment:
+      ASR_PORT: "8000"
+      ASR_ENGINE_URL: "http://asr-engine:8000"
+      ASR_MODEL_ID: "Qwen/Qwen3-ASR-1.7B"
+      ASR_MAX_REALTIME_SESSIONS: "${ASR_MAX_REALTIME_SESSIONS:-4}"
+      ASR_REALTIME_FIRST_UPDATE_SECONDS: "${ASR_REALTIME_FIRST_UPDATE_SECONDS:-0.5}"
+      ASR_REALTIME_UPDATE_SECONDS: "${ASR_REALTIME_UPDATE_SECONDS:-1.0}"
+      ASR_FALLBACK_VAD_THRESHOLD: "0.1"
+      ASR_CANDIDATE_MIN_RMS: "0.0015"
+      ASR_PROMPT_VERIFICATION_MIN_AGREEMENT: "0.45"
+      ASR_API_KEY: "${ASR_API_KEY:-}"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+    volumes:
+      - qwen3_asr_vllm_state:/var/lib/qwen3-asr
+    ports:
+      - "6001:8000"
+    networks:
+      - edge
+      - offline
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10m
+      retries: 4
+
+volumes:
+  qwen3_asr_vllm_state:
+    name: qwen3-asr-vllm-state
+
+networks:
+  edge:
+    name: qwen3-asr-vllm-edge
+  offline:
+    name: qwen3-asr-vllm-offline
+    internal: true

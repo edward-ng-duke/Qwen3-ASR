@@ -1,0 +1,12 @@
+ARG BASE_IMAGE=mygpt-qwen3-asr:v1.2.2
+FROM ${BASE_IMAGE}
+
+ARG ENGINE_VLLM_VERSION=0.14.0
+ENV ASR_VLLM_VERSION=${ENGINE_VLLM_VERSION}
+
+COPY backend.py /opt/qwen3-asr-vllm/vllm_hotword/app/backend.py
+
+RUN python3 -m compileall -q /opt/qwen3-asr-vllm/vllm_hotword/app/backend.py
+
+LABEL org.opencontainers.image.version="1.2.2-gateway-compat" \
+      ai.qwen.engine.vllm.version=${ENGINE_VLLM_VERSION}

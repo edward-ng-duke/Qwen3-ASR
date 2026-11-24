@@ -1,0 +1,6 @@
+# Keep FastAPI/Uvicorn/Pydantic/Prometheus/HTTPX versions from the digest-pinned
+# vLLM image so the engine's compiled and API dependency set is not replaced.
+silero-vad==6.2.1
+onnxruntime==1.23.2
+soxr==1.1.0
+soundfile==0.14.0
